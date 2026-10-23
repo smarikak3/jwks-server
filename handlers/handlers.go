@@ -9,10 +9,9 @@ import (
 	"jwks-server/jwks"
 )
 
-// Server contains the keys used by the JWKS server.
+// Server retrieves signing keys from SQLite.
 type Server struct {
-	ValidKey   *jwks.Key
-	ExpiredKey *jwks.Key
+	Store *jwks.Store
 }
 
 // JWKS represents a JSON Web Key Set.
@@ -20,80 +19,71 @@ type JWKS struct {
 	Keys []jwks.JWK `json:"keys"`
 }
 
-// JWKSHandler serves public keys that have not expired.
+// JWKSHandler returns all unexpired public keys.
 func (s *Server) JWKSHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	keys := []jwks.JWK{}
-
-	if !s.ValidKey.IsExpired() {
-		keys = append(keys, s.ValidKey.ToJWK())
+	keys, err := s.Store.ValidKeys()
+	if err != nil {
+		http.Error(w, "failed to read keys", http.StatusInternalServerError)
+		return
 	}
 
-	response := JWKS{
-		Keys: keys,
+	response := JWKS{Keys: make([]jwks.JWK, 0, len(keys))}
+	for _, key := range keys {
+		response.Keys = append(response.Keys, key.ToJWK())
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-// AuthHandler issues a JWT.
+// AuthHandler mocks authentication and signs a JWT using a stored key.
 func (s *Server) AuthHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	key := s.ValidKey
+	// Any presence of this parameter selects an expired key.
+	_, expired := r.URL.Query()["expired"]
 
-	// Check whether the expired query parameter is present.
-	expired := false
-	if _, exists := r.URL.Query()["expired"]; exists {
-		expired = true
-		key = s.ExpiredKey
+	key, err := s.Store.GetKey(expired)
+	if err != nil {
+		http.Error(w, "failed to read signing key", http.StatusInternalServerError)
+		return
 	}
 
-	// Normal JWTs expire in one hour.
-	expiration := time.Now().Add(time.Hour)
-
-	// Expired JWTs use an expiration time in the past.
+	now := time.Now()
+	expiration := now.Add(time.Hour)
 	if expired {
-		expiration = time.Now().Add(-time.Hour)
+		expiration = key.ExpiresAt
+	} else if key.ExpiresAt.Before(expiration) {
+		expiration = key.ExpiresAt
 	}
 
 	claims := jwt.MapClaims{
-		"sub": "test-user",
-		"iat": time.Now().Unix(),
+		"sub": "userABC",
+		"iat": now.Unix(),
 		"exp": expiration.Unix(),
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-
-	// Include the key ID in the JWT header.
 	token.Header["kid"] = key.Kid
 
 	signedToken, err := token.SignedString(key.PrivateKey)
 	if err != nil {
-		http.Error(
-			w,
-			"failed to sign token",
-			http.StatusInternalServerError,
-		)
+		http.Error(w, "failed to sign token", http.StatusInternalServerError)
 		return
 	}
 
-	response := map[string]string{
-		"token": signedToken,
-	}
-
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	_ = json.NewEncoder(w).Encode(response)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"token": signedToken,
+	})
 }

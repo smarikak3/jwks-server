@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,228 +16,190 @@ import (
 func createTestServer(t *testing.T) *Server {
 	t.Helper()
 
-	validKey, err := jwks.GenerateKey(
-		"valid-test-key",
-		time.Now().Add(time.Hour),
+	store, err := jwks.OpenStore(
+		filepath.Join(t.TempDir(), "test.db"),
 	)
 	if err != nil {
-		t.Fatalf("failed to generate valid key: %v", err)
+		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 
-	expiredKey, err := jwks.GenerateKey(
-		"expired-test-key",
+	for _, expiration := range []time.Time{
+		time.Now().Add(2 * time.Hour),
 		time.Now().Add(-time.Hour),
-	)
-	if err != nil {
-		t.Fatalf("failed to generate expired key: %v", err)
+	} {
+		key, err := jwks.GenerateKey("", expiration)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SaveKey(key); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	return &Server{
-		ValidKey:   validKey,
-		ExpiredKey: expiredKey,
-	}
+	return &Server{Store: store}
 }
 
 func TestJWKSHandler(t *testing.T) {
 	server := createTestServer(t)
-
-	request := httptest.NewRequest(
-		http.MethodGet,
-		"/.well-known/jwks.json",
-		nil,
-	)
+	valid, err := server.Store.GetKey(false)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	recorder := httptest.NewRecorder()
-
-	server.JWKSHandler(recorder, request)
+	server.JWKSHandler(recorder, httptest.NewRequest(
+		http.MethodGet, "/.well-known/jwks.json", nil,
+	))
 
 	if recorder.Code != http.StatusOK {
-		t.Errorf("expected status 200, got %d", recorder.Code)
+		t.Fatalf("expected 200, got %d", recorder.Code)
 	}
 
 	var response JWKS
-
-	err := json.NewDecoder(recorder.Body).Decode(&response)
-	if err != nil {
-		t.Fatalf("failed to decode JWKS response: %v", err)
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
 	}
-
 	if len(response.Keys) != 1 {
-		t.Fatalf("expected 1 key, got %d", len(response.Keys))
+		t.Fatalf("expected one valid key, got %d", len(response.Keys))
 	}
-
-	if response.Keys[0].Kid != "valid-test-key" {
-		t.Errorf(
-			"expected valid-test-key, got %s",
-			response.Keys[0].Kid,
-		)
-	}
-
-	if response.Keys[0].Kid == "expired-test-key" {
-		t.Error("expired key should not appear in JWKS")
-	}
-}
-
-func TestJWKSRejectsPost(t *testing.T) {
-	server := createTestServer(t)
-
-	request := httptest.NewRequest(
-		http.MethodPost,
-		"/.well-known/jwks.json",
-		nil,
-	)
-
-	recorder := httptest.NewRecorder()
-
-	server.JWKSHandler(recorder, request)
-
-	if recorder.Code != http.StatusMethodNotAllowed {
-		t.Errorf(
-			"expected status 405, got %d",
-			recorder.Code,
-		)
+	if response.Keys[0] != valid.ToJWK() {
+		t.Error("JWKS did not match the stored public key")
 	}
 }
 
 func TestAuthHandler(t *testing.T) {
 	server := createTestServer(t)
 
-	request := httptest.NewRequest(
-		http.MethodPost,
-		"/auth",
-		nil,
-	)
-
-	recorder := httptest.NewRecorder()
-
-	server.AuthHandler(recorder, request)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", recorder.Code)
+	tests := []struct {
+		name    string
+		path    string
+		basic   bool
+		expired bool
+	}{
+		{"JSON credentials", "/auth", false, false},
+		{"Basic credentials", "/auth", true, false},
+		{"expired key", "/auth?expired=true", false, true},
+		{"parameter presence", "/auth?expired=false", false, true},
 	}
 
-	var response map[string]string
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodPost,
+				tt.path,
+				strings.NewReader(
+					`{"username":"userABC","password":"password123"}`,
+				),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			if tt.basic {
+				request.SetBasicAuth("userABC", "password123")
+			}
 
-	err := json.NewDecoder(recorder.Body).Decode(&response)
-	if err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
+			recorder := httptest.NewRecorder()
+			server.AuthHandler(recorder, request)
 
-	tokenString := response["token"]
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d", recorder.Code)
+			}
 
-	if tokenString == "" {
-		t.Fatal("expected JWT token")
-	}
+			var response map[string]string
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response["token"] == "" {
+				t.Fatal("missing token")
+			}
 
-	token, err := jwt.Parse(
-		tokenString,
-		func(token *jwt.Token) (interface{}, error) {
-			return &server.ValidKey.PrivateKey.PublicKey, nil
-		},
-	)
+			key, err := server.Store.GetKey(tt.expired)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	if err != nil {
-		t.Fatalf("failed to parse JWT: %v", err)
-	}
+			// Check signatures for both valid and expired JWTs.
+			options := []jwt.ParserOption{
+				jwt.WithValidMethods([]string{"RS256"}),
+			}
+			if tt.expired {
+				options = append(options, jwt.WithoutClaimsValidation())
+			}
 
-	if !token.Valid {
-		t.Error("expected valid JWT")
-	}
+			token, err := jwt.Parse(
+				response["token"],
+				func(token *jwt.Token) (interface{}, error) {
+					return &key.PrivateKey.PublicKey, nil
+				},
+				options...,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !token.Valid {
+				t.Fatal("invalid signature or claims")
+			}
+			if token.Header["kid"] != key.Kid {
+				t.Error("JWT kid does not match stored key")
+			}
 
-	if token.Header["kid"] != "valid-test-key" {
-		t.Errorf(
-			"expected valid-test-key kid, got %v",
-			token.Header["kid"],
-		)
-	}
-}
-
-func TestExpiredAuthHandler(t *testing.T) {
-	server := createTestServer(t)
-
-	request := httptest.NewRequest(
-		http.MethodPost,
-		"/auth?expired=true",
-		nil,
-	)
-
-	recorder := httptest.NewRecorder()
-
-	server.AuthHandler(recorder, request)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", recorder.Code)
-	}
-
-	var response map[string]string
-
-	err := json.NewDecoder(recorder.Body).Decode(&response)
-	if err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
-
-	tokenString := response["token"]
-
-	if tokenString == "" {
-		t.Fatal("expected expired JWT token")
-	}
-
-	parser := jwt.NewParser(
-		jwt.WithoutClaimsValidation(),
-	)
-
-	token, _, err := parser.ParseUnverified(
-		tokenString,
-		jwt.MapClaims{},
-	)
-
-	if err != nil {
-		t.Fatalf("failed to parse expired JWT: %v", err)
-	}
-
-	if token.Header["kid"] != "expired-test-key" {
-		t.Errorf(
-			"expected expired-test-key kid, got %v",
-			token.Header["kid"],
-		)
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		t.Fatal("expected MapClaims")
-	}
-
-	expValue, err := claims.GetExpirationTime()
-	if err != nil {
-		t.Fatalf("failed to get expiration time: %v", err)
-	}
-
-	if expValue == nil {
-		t.Fatal("expected exp claim")
-	}
-
-	if expValue.Time.After(time.Now()) {
-		t.Error("expected JWT expiration time to be in the past")
+			claims := token.Claims.(jwt.MapClaims)
+			exp, err := claims.GetExpirationTime()
+			if err != nil || exp == nil {
+				t.Fatal("missing or invalid expiration")
+			}
+			if tt.expired && exp.Time.After(time.Now()) {
+				t.Error("expected expired JWT")
+			}
+			if !tt.expired && !exp.Time.After(time.Now()) {
+				t.Error("expected unexpired JWT")
+			}
+		})
 	}
 }
 
-func TestAuthRejectsGet(t *testing.T) {
+func TestHandlersRejectWrongMethod(t *testing.T) {
 	server := createTestServer(t)
 
-	request := httptest.NewRequest(
-		http.MethodGet,
-		"/auth",
-		strings.NewReader(""),
-	)
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+		method  string
+	}{
+		{"JWKS", server.JWKSHandler, http.MethodPost},
+		{"auth", server.AuthHandler, http.MethodGet},
+	}
 
-	recorder := httptest.NewRecorder()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			tt.handler(recorder, httptest.NewRequest(tt.method, "/", nil))
+			if recorder.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("expected 405, got %d", recorder.Code)
+			}
+		})
+	}
+}
 
-	server.AuthHandler(recorder, request)
+func TestHandlersDatabaseFailure(t *testing.T) {
+	server := createTestServer(t)
+	server.Store.Close()
 
-	if recorder.Code != http.StatusMethodNotAllowed {
-		t.Errorf(
-			"expected status 405, got %d",
-			recorder.Code,
-		)
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+		method  string
+	}{
+		{"JWKS", server.JWKSHandler, http.MethodGet},
+		{"auth", server.AuthHandler, http.MethodPost},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			tt.handler(recorder, httptest.NewRequest(tt.method, "/", nil))
+			if recorder.Code != http.StatusInternalServerError {
+				t.Fatalf("expected 500, got %d", recorder.Code)
+			}
+		})
 	}
 }
